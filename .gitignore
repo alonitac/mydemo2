@@ -5,3 +5,4 @@ tests/school-checks/
 __pycache__/
 *.pyc
 .venv/
+venv/
