@@ -1,0 +1,2607 @@
+"""e0 — the Exit0 CLI.
+
+Holds everything deterministic in a course workflow: which tasks are ready, what their rules
+are, whether the student's work passes. The agent asks; it does not guess.
+
+Single file, standard library only, no install step. Never crashes: every invocation
+exits 0 and prints exactly one JSON object to stdout, so a failure is something the
+agent can read aloud rather than a dead end.
+
+Envelope: every reply is `{"command", "message", "guidance", "data", "upgrade"}`. `message`
+is for the student, said as written. `guidance` is for the agent. `upgrade` is empty, or
+a note for the student when a newer compatible release exists, including the command they run.
+"""
+
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import quote
+
+# Must match the git tag exactly — skills are fetched from this ref.
+E0_VERSION = "v1.3"
+
+
+# ---------------------------------------------------------------- envelope
+
+def reply(command, data=None, message="", guidance=""):
+    """Every command returns this. `message` is for the student. `guidance` is for the agent.
+    Either may be empty. `data` holds the facts. `upgrade` is filled in by `main`."""
+    return {
+        "command": command,
+        "message": message or "",
+        "guidance": guidance or "",
+        "data": data if data is not None else {},
+        "upgrade": "",
+    }
+
+def problem(command, summary, guidance, message=None, data=None, tell=False):
+    """A failure, in the same shape as every other reply.
+
+    The long notes (Git missing, GitHub, a merge conflict) pass `message`: that is what the
+    student hears. `tell=True` means `summary` itself is the student text. Otherwise only the
+    agent hears it, and both strings go to `guidance`.
+    """
+    if message is not None:
+        heard = message
+    elif tell:
+        heard = summary
+    else:
+        heard = ""
+        guidance = f"{summary} {guidance}".strip()
+    return reply(command, data, heard, guidance)
+
+
+# ---------------------------------------------------------------- process
+
+def run_cmd(argv, cwd, timeout=None):
+    """Run a command. Returns (returncode, stdout, stderr) and never raises."""
+    try:
+        proc = subprocess.run(
+            list(argv),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+def run_git(cwd, *args):
+    """Run a git command. Returns (returncode, stdout, stderr) and never raises."""
+    return run_cmd(("git", *args), cwd)
+
+def run_gh(cwd, *args):
+    """Run a GitHub CLI command; issue and pr commands go to `origin`. Returns
+    (returncode, stdout, stderr) and never raises."""
+    if args and args[0] in ("issue", "pr"):
+        repo = origin_repo(cwd)
+        if repo is None:
+            return 1, "", "this repo has no GitHub remote called origin"
+        args = (*args, "--repo", repo)
+    return run_cmd(("gh", *args), cwd, timeout=60)
+
+
+# ---------------------------------------------------------------- paths
+
+def repo_root(start=None):
+    """The git top level containing `start`, or None if there is not one."""
+    base = pathlib.Path(start) if start is not None else pathlib.Path.cwd()
+    code, out, _ = run_git(base, "rev-parse", "--show-toplevel")
+    if code != 0 or not out:
+        return None
+    return pathlib.Path(out)
+
+def exit0_dir(root):
+    return pathlib.Path(root) / ".exit0"
+
+def state_dir(root):
+    return exit0_dir(root) / "state"
+
+def task_content_dir(root, task_id):
+    return pathlib.Path(root) / "content" / str(task_id).lower()
+
+def school_checks_dir(root, task_id):
+    return pathlib.Path(root) / "tests" / "school-checks" / str(task_id).lower()
+
+def read_json(path, default):
+    """JSON in `path`, or `default` when the file is missing or not JSON."""
+    path = pathlib.Path(path)
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return default
+
+def write_json(path, payload):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+def read_config(root):
+    return read_json(exit0_dir(root) / "config.json", {})
+
+def read_profile(root):
+    return read_json(state_dir(root) / "profile.json", {})
+
+def write_profile(root, profile):
+    write_json(state_dir(root) / "profile.json", profile)
+
+def detect_profile(root):
+    names = {"darwin": "macos", "windows": "windows"}
+    return {"os": names.get(platform.system().lower(), "linux")}
+
+
+# A newer release is compatible when it has the same major version. The note's command
+# downloads the latest release, so the note appears only when that latest release itself
+# is the greater compatible one.
+LATEST_E0_URL = "https://github.com/exit0-io/e0/releases/latest/download/e0"
+
+def version_parts(tag):
+    """(major, minor, patch) for 'v1.3' or 'v1.3.1'. None when it is not that shape."""
+    match = re.fullmatch(r"v(\d+)(?:\.(\d+))?(?:\.(\d+))?", tag or "")
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+def newer_compatible(current, candidate):
+    """True when `candidate` is a later release of the same major version."""
+    have = version_parts(current)
+    newer = version_parts(candidate)
+    if not have or not newer:
+        return False
+    return newer[0] == have[0] and newer > have
+
+def latest_release_tag():
+    """The tag of the newest GitHub release, or None when GitHub cannot be reached."""
+    import urllib.request
+    request = urllib.request.Request(
+        "https://api.github.com/repos/exit0-io/e0/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "e0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    tag = payload.get("tag_name") if isinstance(payload, dict) else None
+    return tag if isinstance(tag, str) else None
+
+def upgrade_command(os_name):
+    """The command the student runs. It always takes the latest release, never a pinned tag."""
+    if os_name == "windows":
+        return f'curl.exe -fsSL "{LATEST_E0_URL}" -o .exit0/e0\npython .exit0/e0 init'
+    return f'curl -fsSL "{LATEST_E0_URL}" -o .exit0/e0 && chmod +x .exit0/e0 && .exit0/e0 init'
+
+def upgrade_note(latest, os_name):
+    return (
+        f"A newer e0 is available ({latest}). You have {E0_VERSION}. "
+        f"{latest} works with this course. To upgrade, run this from the repo folder:\n\n"
+        f"```\n{upgrade_command(os_name)}\n```\n\n"
+        "After it finishes, start a new chat."
+    )
+
+def upgrade_message(root):
+    """The student note when a newer compatible release exists. Empty otherwise.
+
+    Every reply carries it. The learning skill says it only on the first e0 of the
+    conversation.
+    """
+    if os.environ.get("E0_SKIP_UPGRADE_CHECK"):
+        return ""
+    latest = latest_release_tag()
+    if latest and newer_compatible(E0_VERSION, latest):
+        return upgrade_note(latest, detect_profile(root)["os"])
+    return ""
+
+def attach_upgrade(result):
+    """Put `upgrade` on a reply. Empty when there is nothing to report."""
+    if os.environ.get("E0_SKIP_UPGRADE_CHECK"):
+        result["upgrade"] = ""
+        return result
+    root = repo_root()
+    result["upgrade"] = upgrade_message(root) if root else ""
+    return result
+
+# A dismissed reminder sleeps this long. Not progress: progress lives in GitHub.
+DISMISS_DAYS = 7
+
+def read_dismissed(root, today=None):
+    """{task id: date the reminder wakes up}, expired entries dropped."""
+    raw = read_json(state_dir(root) / "dismissed.json", {})
+    today = (today or datetime.date.today()).isoformat()
+    return {
+        task: until
+        for task, until in raw.items()
+        if isinstance(until, str) and until > today
+    }
+
+def write_dismissed(root, dismissed):
+    write_json(state_dir(root) / "dismissed.json", dismissed)
+
+
+# ---------------------------------------------------------------- git
+
+# `git status --porcelain` codes of a file caught in a merge conflict.
+_UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+
+def git_out(cwd, *args):
+    """Stdout of a git command, or "" when git fails."""
+    code, out, _ = run_git(cwd, *args)
+    return out if code == 0 else ""
+
+def current_branch(root):
+    """The checked-out branch name, or None (detached HEAD, no commits, git missing)."""
+    return git_out(root, "branch", "--show-current") or None
+
+def title_slug(title):
+    """The branch-name form of a task title: lowercase, hyphens, nothing else."""
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+def task_for_branch(branch, tasks):
+    """The task a branch name points at: it holds the task id (t010) or the title as a slug
+    (say-hello). None when the name says nothing."""
+    if not branch:
+        return None
+    name = branch.lower()
+    for task in tasks:
+        slug = title_slug(task["title"])
+        if task["id"].lower() in name or (slug and slug in name):
+            return task["id"]
+    return None
+
+def git_facts(root, in_progress=()):
+    """Where the student stands in Git, so the agent picks the right row of git.md without
+    looking or inferring. `task` is the task in progress the branch name points at.
+    `unpushedCommits` is None when GitHub has no copy of the branch yet. `branchCommits`
+    counts the commits `main` does not have (0: the student has not started; more: they are
+    mid-way). `branches` lists every local branch with the task its name points at, so the
+    agent can send the student back to a branch they already made. `mergingFrom` is the
+    branch of a merge that stopped on conflicts, else None."""
+    branch = current_branch(root)
+    uncommitted, conflicts = [], []
+    for line in git_out(root, "status", "--porcelain", "--untracked-files=all").splitlines():
+        if len(line) < 4:
+            continue
+        status, path = line[:2], line[3:]
+        (conflicts if status in _UNMERGED else uncommitted).append(path)
+
+    unpushed = None
+    branch_commits = None
+    if branch:
+        counted = git_out(root, "rev-list", "--count", f"origin/{branch}..{branch}")
+        if counted.isdigit():
+            unpushed = int(counted)
+        if branch == "main":
+            branch_commits = 0
+        else:
+            counted = git_out(root, "rev-list", "--count", f"main..{branch}")
+            if counted.isdigit():
+                branch_commits = int(counted)
+
+    branches = [
+        {"name": name, "task": task_for_branch(name, in_progress)}
+        for name in git_out(
+            root, "for-each-ref", "--format=%(refname:short)", "refs/heads/"
+        ).splitlines()
+        if name
+    ]
+    merging = git_out(root, "name-rev", "--name-only", "--refs=refs/heads/*", "MERGE_HEAD")
+    return {
+        "branch": branch,
+        "task": task_for_branch(branch, in_progress),
+        "uncommitted": uncommitted,
+        "conflicts": conflicts,
+        "unpushedCommits": unpushed,
+        "branchCommits": branch_commits,
+        "branches": branches,
+        "mergingFrom": merging if merging and merging != "undefined" else None,
+    }
+
+GIT_INSTALL_URL = "https://git-scm.com/downloads"
+
+CONFLICT_VIZ_PORT = 8765
+
+AGAIN = "When they say it is done, run the same e0 command again."
+
+def git_missing_problem(command):
+    return problem(
+        command,
+        "Git is not installed.",
+        AGAIN,
+        "Before anything else we need **Git** on your computer. It is the tool developers "
+        "use to save their work step by step and to work together on one codebase. Install "
+        f"it from {GIT_INSTALL_URL}, then tell me. To check it worked, run:\n"
+        "```bash\ngit --version\n```",
+    )
+
+def not_a_git_repo_problem(command):
+    here = pathlib.Path.cwd()
+    return problem(
+        command,
+        "e0 can't find a git repository here.",
+        AGAIN,
+        f"I cannot find a Git repository in this folder (`{here}`). The course lives in a "
+        "Git repo: that is how we save work and open it on GitHub. Open the folder of your "
+        "course project (the one you cloned from GitHub) and tell me. If you have not cloned "
+        "it yet, clone it first, then open that folder.",
+    )
+
+def merge_conflict_problem(command, git):
+    """A merge conflict is a hard stop: the student fixes it before anything else.
+    The message is the student text; guidance has the agent start the simulator."""
+    files = git["conflicts"]
+    files_text = ", ".join(f"`{name}`" for name in files)
+    branch = git["branch"] or "this branch"
+    other = git["mergingFrom"] or "the other branch"
+    link = (
+        f"http://localhost:{CONFLICT_VIZ_PORT}/conflict.html"
+        f"?branch={quote(str(branch), safe='')}"
+        f"&other={quote(str(other), safe='')}"
+        f"&file={quote(files[0], safe='')}"
+    )
+    add = " ".join(files)
+    return problem(
+        command,
+        "There is an unresolved merge conflict.",
+        (
+            f"Start `python3 -m http.server {CONFLICT_VIZ_PORT} --directory "
+            ".exit0/skills/learning/assets` in the background (another port if "
+            f"{CONFLICT_VIZ_PORT} is taken: change the port in the link in message). "
+            + AGAIN
+        ),
+        f"I see a **merge conflict** in {files_text}. Don't worry: this is common, and it is "
+        "fixable. It usually happens when two developers change the same lines of the same "
+        f"file. You are the only developer here, so it happened because the same lines were "
+        f"changed on two of your branches, `{branch}` and `{other}`. To see step by step how "
+        f"you got here, open {link}.\n"
+        "\n"
+        "Git merged every file it could on its own; those are already staged, ready to commit. "
+        f"For {files_text} it could not choose, so it stopped and wrote both versions into the "
+        "file between markers: `<<<<<<<`, `=======`, `>>>>>>>`. Your job: decide, for each spot, "
+        "what the final text should be.\n"
+        "\n"
+        "VS Code helps. Open the file, click **Resolve in Merge Editor**, and for each spot "
+        "choose the current version, the incoming one, both, or type the result. Then "
+        f"**Complete Merge**. After that:\n```bash\ngit add {add}\n```\n"
+        "and a commit, and the merge is done.",
+    )
+
+def require_repo(command):
+    """Return (root, None) or (None, a reply). Git missing and not-a-repo put the
+    student text in message, same as github_problem."""
+    if shutil.which("git") is None:
+        return None, git_missing_problem(command)
+    root = repo_root()
+    if root is None:
+        return None, not_a_git_repo_problem(command)
+    return root, None
+
+
+# ---------------------------------------------------------------- github
+# An open issue titled "[T010] ..." means that task is in progress. A closed one means complete.
+
+# e0 works with the `origin` remote only: a fork that also has an `upstream` still reads and
+# writes the student's own repo, and gh never has to ask which one.
+GITHUB_REMOTE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])"
+    r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$"
+)
+
+def origin_url(root):
+    return git_out(root, "config", "--get", "remote.origin.url") or None
+
+def origin_repo(root):
+    """OWNER/REPO of the GitHub repo `origin` points at, or None."""
+    match = GITHUB_REMOTE.match(origin_url(root) or "")
+    return match["repo"] if match else None
+
+GH_INSTALL_URL = "https://github.com/cli/cli#installation"
+
+def github_problem(command, root, what, error):
+    """Why e0 could not work with GitHub, as a problem whose message is the student text.
+    The first cause that holds wins: gh missing, no GitHub origin, gh logged out, else the
+    error itself."""
+    if shutil.which("gh") is None:
+        return problem(
+            command,
+            f"{what}: the GitHub CLI (gh) is not installed.",
+            AGAIN,
+            "Before we go on, we need one more tool: the **GitHub CLI** (`gh`). Your progress "
+            "lives in the issues of your repo on GitHub, and `gh` is how I read and open them. "
+            f"Install it with GitHub's official guide for your system: {GH_INSTALL_URL}. "
+            "Then run `gh auth login` in your terminal to log in, and tell me when it is done.",
+        )
+    if origin_repo(root) is None:
+        url = origin_url(root)
+        where = (
+            f"Your `origin` remote points to {url}, which is not a repo on GitHub."
+            if url
+            else "Your repo has no remote called `origin`."
+        )
+        fix = "set-url" if url else "add"
+        return problem(
+            command,
+            f"{what}: origin is not a GitHub repo ({url or 'no origin remote'}).",
+            AGAIN,
+            f"{where} Your progress lives in the issues of your repo on GitHub, and I always "
+            "work with `origin`, so it must point there. Copy your repo's address from the green "
+            "**Code** button on its GitHub page, then run:\n"
+            f"```bash\ngit remote {fix} origin <your-repo-address>\n```\n"
+            "Tell me when it is done.",
+        )
+    code, _, _ = run_gh(root, "auth", "status", "--hostname", "github.com")
+    if code != 0:
+        return problem(
+            command,
+            f"{what}: the GitHub CLI (gh) is not logged in.",
+            AGAIN,
+            "The GitHub CLI (`gh`) is installed, but it is not logged in to your GitHub account "
+            "yet, so I cannot read or open the issues of your repo. In your terminal, run:\n"
+            "```bash\ngh auth login\n```\n"
+            "It asks a few questions: choose **GitHub.com**, then **Login with a web browser**, "
+            "and follow the steps. Tell me when it is done.",
+        )
+    return problem(
+        command,
+        f"{what}. ({error})",
+        "Run the same e0 command again when they ask.",
+        f"I could not reach GitHub just now ({error}). It may be a network problem, so let's "
+        "try again in a moment. If it keeps happening, please report it with this error at "
+        "https://github.com/exit0-io/e0/issues.",
+    )
+
+ISSUE_TASK_ID = re.compile(r"^\s*\[([^\]]+)\]")
+
+def gh_error(err, out):
+    return err or out or "the gh command failed"
+
+def gh_json(root, *args):
+    """Run a gh command that prints JSON. Returns (parsed, None) or (None, error_text)."""
+    code, out, err = run_gh(root, *args)
+    if code != 0:
+        return None, gh_error(err, out)
+    try:
+        return json.loads(out or "[]"), None
+    except ValueError:
+        return None, "gh returned something that is not JSON"
+
+def gh_body(root, body, *args):
+    """Run a gh command that takes --body-file, with this body exactly. Returns
+    (stdout, None) or (None, error_text)."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+    try:
+        handle.write(body)
+        handle.close()
+        code, out, err = run_gh(root, *args, "--body-file", handle.name)
+    finally:
+        try:
+            pathlib.Path(handle.name).unlink()
+        except OSError:
+            pass
+    if code != 0:
+        return None, gh_error(err, out)
+    return out, None
+
+def gh_post(root, marker, text, *args):
+    """Post marker + text through gh_body."""
+    return gh_body(root, marker + "\n" + text.strip() + "\n", *args)
+
+# What e0 posts on GitHub carries a marker, so status can count it back without guessing.
+REVIEW_MARKER = "<!-- e0:review -->"
+
+QUESTIONS_MARKER = "<!-- e0:questions -->"
+
+# statusCheckRollup: a CheckRun has `status` and `conclusion`, a StatusContext has `state`.
+_CI_FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+
+_CI_PENDING = {"", "PENDING", "EXPECTED"}
+
+def ci_verdict(rollup):
+    """One word for the CI of a pull request: none, pending, failing, or passing."""
+    if not rollup:
+        return "none"
+    verdict = "passing"
+    for item in rollup:
+        conclusion = str(item.get("conclusion") or item.get("state") or "").upper()
+        status = str(item.get("status") or "COMPLETED").upper()
+        if conclusion in _CI_FAILED:
+            return "failing"
+        if status != "COMPLETED" or conclusion in _CI_PENDING:
+            verdict = "pending"
+    return verdict
+
+def _bodies(items):
+    """The text bodies of gh comments or reviews, whichever shape gh gave them in."""
+    if isinstance(items, dict):
+        items = items.get("nodes", [])
+    return [str(item.get("body") or "") for item in items or [] if isinstance(item, dict)]
+
+def _task_for_title(catalog, title):
+    match = ISSUE_TASK_ID.match(title or "")
+    return find_task(catalog, match.group(1)) if match else None
+
+def _pr_for(task, issue_number, prs, catalog):
+    """The pull request linked to a task: its title names the task, or its body mentions the
+    task's issue number. A merged PR wins, then an open one, then the newest closed one."""
+    linked = []
+    for pr in prs:
+        by_title = _task_for_title(catalog, pr.get("title")) is task
+        by_body = issue_number is not None and re.search(
+            rf"(?<![\w/])#{issue_number}\b", pr.get("body") or ""
+        )
+        if by_title or by_body:
+            linked.append(pr)
+    if not linked:
+        return None
+    rank = {"MERGED": 0, "OPEN": 1, "CLOSED": 2}
+    best = sorted(linked, key=lambda pr: (rank.get(pr.get("state", "").upper(), 3), -pr.get("number", 0)))[0]
+    return {
+        "number": best.get("number"),
+        "url": best.get("url"),
+        "state": best.get("state"),
+        "merged": best.get("state", "").upper() == "MERGED",
+        "branch": best.get("headRefName"),
+        "checks": ci_verdict(best.get("statusCheckRollup")),
+        "reviews": sum(REVIEW_MARKER in body for body in _bodies(best.get("reviews"))),
+    }
+
+def github_progress(root, catalog):
+    """Read the student's progress from the GitHub issues and pull requests of this repo.
+
+    Returns (progress, None) or (None, error_text). `progress` maps a task id to
+    {"state": "in_progress" | "complete", "issue": {...}, "pr": {...} | None,
+    "questionsRecorded": bool}. An open issue wins over a closed one for the same task.
+    """
+    issues, error = gh_json(
+        root, "issue", "list", "--state", "all", "--limit", "1000",
+        "--json", "number,title,state,url,comments",
+    )
+    if error:
+        return None, error
+    prs, error = gh_json(
+        root, "pr", "list", "--state", "all", "--limit", "1000",
+        "--json", "number,title,state,url,body,headRefName,statusCheckRollup,reviews",
+    )
+    if error:
+        return None, error
+
+    progress = {}
+    for issue in issues:
+        task = _task_for_title(catalog, issue.get("title"))
+        if task is None:
+            continue
+        state = "in_progress" if issue.get("state", "").upper() == "OPEN" else "complete"
+        current = progress.get(task["id"])
+        if current and current["state"] == "in_progress":
+            continue
+        progress[task["id"]] = {
+            "state": state,
+            "issue": {
+                "number": issue.get("number"),
+                "url": issue.get("url"),
+                "state": issue.get("state"),
+            },
+            "pr": _pr_for(task, issue.get("number"), prs, catalog),
+            "questionsRecorded": any(
+                QUESTIONS_MARKER in body for body in _bodies(issue.get("comments"))
+            ),
+        }
+    return progress, None
+
+def statuses_from(progress):
+    return {task_id: entry["state"] for task_id, entry in progress.items()}
+
+def require_progress(command, root, catalog):
+    """Return (progress, None) or (None, problem_payload)."""
+    progress, error = github_progress(root, catalog)
+    if progress is None:
+        return None, github_problem(
+            command, root, "e0 could not read the GitHub issues of this repo", error
+        )
+    return progress, None
+
+def pr_diff(root, pr):
+    """The diff of a pull request: (text, None), or (None, error_text) when gh could not
+    give it."""
+    if not pr:
+        return None, "no pull request"
+    code, out, err = run_gh(root, "pr", "diff", str(pr["number"]))
+    return (out, None) if code == 0 else (None, gh_error(err, out))
+
+
+# ---------------------------------------------------------------- course
+
+# Framework skills and the files each one is made of, relative to cli/skills/<name>/.
+FRAMEWORK_SKILLS = {
+    "learning": [
+        "SKILL.md",
+        "references/git.md",
+        "assets/checkout.html",
+        "assets/conflict.html",
+    ],
+}
+
+def raw_content_url(config, path):
+    """URL for a file in the course content repo."""
+    base = config.get("_rawContentBase", "").rstrip("/")
+    if base:
+        return f"{base}/{path}"
+    repo = config.get("courseContentRepo", "")
+    return f"https://raw.githubusercontent.com/{repo}/main/{path}"
+
+def raw_framework_url(config, path, ref=None):
+    """URL for a file in the e0 framework repo, at this release unless `ref` says otherwise."""
+    base = config.get("_rawFrameworkBase", "").rstrip("/")
+    if base:
+        return f"{base}/{path}"
+    return f"https://raw.githubusercontent.com/exit0-io/e0/{ref or E0_VERSION}/cli/{path}"
+
+def fetch_text(url):
+    """Fetch a URL and return its text body, or None on any error."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            return resp.read().decode("utf-8")
+    except Exception:  # noqa: BLE001
+        return None
+
+def fetch_framework_text(config, path):
+    """Fetch a framework file at this release. If the release tag is not published yet
+    (an e0 taken from a branch), fall back to main so the skills still arrive."""
+    text = fetch_text(raw_framework_url(config, path))
+    if text is None and not config.get("_rawFrameworkBase"):
+        text = fetch_text(raw_framework_url(config, path, ref="main"))
+    return text
+
+def read_catalog(root):
+    return read_json(exit0_dir(root) / "catalog.json", None)
+
+def find_task(catalog, task_id):
+    if not catalog:
+        return None
+    wanted = str(task_id).strip().lower()
+    for task in catalog.get("tasks", []):
+        if task["id"].lower() == wanted:
+            return task
+    return None
+
+def require_content(command, root):
+    """Return (catalog, None) or (None, problem_payload)."""
+    catalog = read_catalog(root)
+    if catalog is None:
+        return None, problem(
+            command,
+            "The course content has not been downloaded yet.",
+            "Run 'e0 init' to download it.",
+        )
+    return catalog, None
+
+def require_catalog(command):
+    """Return (root, catalog, None) or (None, None, a reply)."""
+    root, failure = require_repo(command)
+    if failure:
+        return None, None, failure
+    catalog, failure = require_content(command, root)
+    if failure:
+        return None, None, failure
+    return root, catalog, None
+
+def ordered_tasks(catalog):
+    return sorted(catalog.get("tasks", []), key=lambda item: item.get("order", 0))
+
+def available_tasks(catalog, statuses):
+    """Tasks the student can start now: not started, not complete, and every task they
+    build on is complete. Tasks form a tree, so this is a list, not a single task."""
+    return [
+        task
+        for task in ordered_tasks(catalog)
+        if statuses.get(task["id"]) is None and not unmet_dependencies(task, statuses)
+    ]
+
+def tasks_in_progress(catalog, statuses):
+    return [task for task in ordered_tasks(catalog) if statuses.get(task["id"]) == "in_progress"]
+
+def task_summary(task):
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "description": task.get("description", ""),
+    }
+
+def unmet_dependencies(task, statuses):
+    return [
+        dependency
+        for dependency in task.get("dependsOn", [])
+        if statuses.get(dependency) != "complete"
+    ]
+
+def download_skills(root, config, catalog):
+    """Fetch framework and course skills into .exit0/skills/. Returns list of downloaded names."""
+    skills_dir = exit0_dir(root) / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = []
+
+    for name, files in FRAMEWORK_SKILLS.items():
+        fetched = False
+        for relative in files:
+            text = fetch_framework_text(config, f"skills/{name}/{relative}")
+            if text is None:
+                continue
+            dest = skills_dir / name / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text, encoding="utf-8")
+            fetched = True
+        if fetched:
+            downloaded.append(name)
+
+    for name in catalog.get("skills", []):
+        text = fetch_text(raw_content_url(config, f"skills/{name}"))
+        if text is not None:
+            (skills_dir / name).write_text(text, encoding="utf-8")
+            downloaded.append(name)
+
+    return downloaded
+
+def dependency_warning(task_id, missing):
+    """The exact words for the student, with the facts for the agent (`missing`). The agent
+    runs `e0 dismiss` when the student agrees to skip the missing tasks."""
+    return {
+        "kind": "dependency",
+        "missing": missing,
+        "message": (
+            f"{task_id} builds on {', '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} not complete yet. "
+            "You can keep going, but you might be missing important background. "
+            f"Want to skip {'it' if len(missing) == 1 else 'them'} for now? Tell me, "
+            f"and I will stop reminding you for {DISMISS_DAYS} days."
+        ),
+    }
+
+def resolve_task(command, args):
+    """Shared entry for commands that take a task id. Returns (root, catalog, task, None)
+    or (None, None, None, problem_payload)."""
+    root, catalog, failure = require_catalog(command)
+    if failure:
+        return None, None, None, failure
+
+    available = ", ".join(task["id"] for task in ordered_tasks(catalog))
+    if not args:
+        return None, None, None, problem(
+            command,
+            f"e0 {command} needs a task id.",
+            f"Use: e0 {command} <id>. The tasks are: {available}",
+        )
+
+    task = find_task(catalog, args[0])
+    if task is None:
+        return None, None, None, problem(
+            command,
+            f"There is no task called '{args[0]}'.",
+            f"The tasks are: {available}",
+            tell=True,
+        )
+    return root, catalog, task, None
+
+def task_paths(task_id):
+    return {
+        "task": f"content/{task_id.lower()}/task.md",
+        "checks": f"tests/school-checks/{task_id.lower()}",
+    }
+
+def fetch_canonical(command, root, task_id):
+    """Return (canonical_text, None) or (None, problem_payload)."""
+    config = read_config(root)
+    text = fetch_text(raw_content_url(config, f"tasks/{task_id.lower()}/task.md"))
+    if text is None:
+        return None, problem(
+            command,
+            f"e0 could not download task {task_id}.",
+            "Check your internet connection.",
+            tell=True,
+        )
+    return text, None
+
+
+# ---------------------------------------------------------------- markers
+
+OPEN_VARIANT = re.compile(r'^\s*<!--\s*e0:variant\s+id="([^"]+)"\s*-->\s*$')
+
+CLOSE_VARIANT = re.compile(r"^\s*<!--\s*/e0:variant\s*-->\s*$")
+
+OPEN_RETONE = re.compile(r'^\s*<!--\s*e0:retone(?:\s+based-on="([^"]*)")?\s*-->\s*$')
+
+CLOSE_RETONE = re.compile(r"^\s*<!--\s*/e0:retone\s*-->\s*$")
+
+WHEN = re.compile(r"^\s*<!--\s*when:\s*(.*?)\s*-->\s*$")
+
+class MarkerError(Exception):
+    """Raised when region markers are malformed. Callers always catch this."""
+
+def parse_when(value):
+    conditions = {}
+    for token in (value or "").split():
+        if "=" not in token:
+            continue
+        key, _, val = token.partition("=")
+        conditions[key.strip()] = val.strip()
+    return conditions
+
+def _split_branches(lines):
+    """Turn the inside of a variant block into a list of branches."""
+    has_when = any(WHEN.match(line) for line in lines)
+    if not has_when:
+        # Collapsed variant: agent selected one branch, no when: markers remain.
+        return [{"when": {}, "text": "".join(lines).strip("\n")}]
+
+    branches = []
+    current = None
+    for line in lines:
+        match = WHEN.match(line)
+        if match:
+            current = {"when": parse_when(match.group(1)), "lines": []}
+            branches.append(current)
+            continue
+        if current is None:
+            if line.strip():
+                raise MarkerError(
+                    "content inside a variant block before the first 'when:' marker"
+                )
+            continue
+        current["lines"].append(line)
+    return [
+        {"when": branch["when"], "text": "".join(branch["lines"]).strip("\n")}
+        for branch in branches
+    ]
+
+def parse_regions(text):
+    """Split a document into ordered fixed / variant / retone segments.
+
+    Every segment carries `raw`, so concatenating them reproduces the input exactly.
+    """
+    lines = text.splitlines(keepends=True)
+    regions = []
+    buffer = []
+    index = 0
+
+    def flush_fixed():
+        if buffer:
+            blob = "".join(buffer)
+            regions.append({"kind": "fixed", "text": blob, "raw": blob})
+            buffer.clear()
+
+    while index < len(lines):
+        line = lines[index]
+
+        if CLOSE_VARIANT.match(line) or CLOSE_RETONE.match(line):
+            raise MarkerError(f"closing marker without an opening one on line {index + 1}")
+
+        open_variant = OPEN_VARIANT.match(line)
+        open_retone = OPEN_RETONE.match(line)
+
+        if not open_variant and not open_retone:
+            buffer.append(line)
+            index += 1
+            continue
+
+        flush_fixed()
+        opener = line
+        body = []
+        closer_pattern = CLOSE_VARIANT if open_variant else CLOSE_RETONE
+        other_opener = OPEN_RETONE if open_variant else OPEN_VARIANT
+        index += 1
+
+        while index < len(lines) and not closer_pattern.match(lines[index]):
+            if OPEN_VARIANT.match(lines[index]) or other_opener.match(lines[index]):
+                raise MarkerError(f"nested region marker on line {index + 1}")
+            body.append(lines[index])
+            index += 1
+
+        if index >= len(lines):
+            raise MarkerError("region opened but never closed")
+
+        closer = lines[index]
+        index += 1
+        raw = opener + "".join(body) + closer
+
+        if open_variant:
+            regions.append(
+                {
+                    "kind": "variant",
+                    "id": open_variant.group(1),
+                    "branches": _split_branches(body),
+                    "text": "".join(body),
+                    "raw": raw,
+                }
+            )
+        else:
+            regions.append(
+                {
+                    "kind": "retone",
+                    "basedOn": open_retone.group(1) or "",
+                    "text": "".join(body),
+                    "raw": raw,
+                }
+            )
+
+    flush_fixed()
+    return regions
+
+def select_branch(branches, facts):
+    for branch in branches:
+        if all(facts.get(key) == value for key, value in branch["when"].items()):
+            return branch
+    return None
+
+def personalization_payload(canonical_text, profile):
+    """What the agent is permitted to act on — and nothing else."""
+    regions = parse_regions(canonical_text)
+    variants = []
+    retone_blocks = []
+    referenced_keys = set()
+
+    for region in regions:
+        if region["kind"] == "variant":
+            variants.append({"id": region["id"], "branches": region["branches"]})
+            for branch in region["branches"]:
+                referenced_keys.update(branch["when"].keys())
+        elif region["kind"] == "retone":
+            retone_blocks.append({"basedOn": region["basedOn"]})
+
+    facts = {key: profile[key] for key in sorted(referenced_keys) if key in profile}
+    return {"variants": variants, "retoneBlocks": retone_blocks, "facts": facts}
+
+def verify_document(canonical_text, personalized_text):
+    """Check that all fixed regions from canonical are intact in the clean personalized doc.
+
+    The personalized doc is clean Markdown with no markers. Returns {"violations": [...]}.
+    """
+    try:
+        regions = parse_regions(canonical_text)
+    except MarkerError as exc:
+        return {
+            "violations": [
+                {
+                    "kind": "structure",
+                    "message": f"The original document has markers with a problem: {exc}",
+                }
+            ]
+        }
+
+    violations = []
+    for region in regions:
+        if region["kind"] == "fixed" and region["text"].strip():
+            if region["text"] not in personalized_text:
+                violations.append(
+                    {
+                        "kind": "fixed",
+                        "message": "Protected text was changed or removed.",
+                    }
+                )
+    return {"violations": violations}
+
+
+# ---------------------------------------------------------------- checks
+
+def sha256_file(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+def read_checks_spec(root, task_id):
+    return read_json(school_checks_dir(root, task_id) / "checks.json", None)
+
+# Written next to every task's checks. The student runs the tests with one plain pytest
+# command; this hook records the result in results.json, in the same folder, so that
+# `e0 status` reports it, and prints one line so the student sees what e0 will see.
+CHECKS_CONFTEST = '''# Exit0 school checks. Do not edit this file.
+# It records the result of each run in results.json, next to the tests, so that the course
+# tool can report it, and prints one line at the end of the run.
+import datetime
+import json
+import pathlib
+
+HERE = pathlib.Path(__file__).resolve().parent
+RESULTS = HERE / "results.json"
+
+
+def _ours(session, report):
+    path = (session.config.rootpath / report.nodeid.split("::")[0]).resolve()
+    return path == HERE or HERE in path.parents
+
+
+def _counts(session):
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    stats = getattr(reporter, "stats", None) or {}
+    reports = {
+        key: [r for r in stats.get(key, []) if hasattr(r, "nodeid") and _ours(session, r)]
+        for key in ("passed", "failed", "error")
+    }
+    failed = sorted({r.nodeid for key in ("failed", "error") for r in reports[key]})
+    return len(reports["passed"]), failed
+
+
+def pytest_sessionfinish(session, exitstatus):
+    passed, failed = _counts(session)
+    result = {
+        "taskId": HERE.name.upper(),
+        "passing": passed > 0 and not failed,
+        "passed": passed,
+        "failed": len(failed),
+        "failedTests": failed,
+        "ranAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    RESULTS.write_text(json.dumps(result, indent=2) + "\\n", encoding="utf-8")
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    session = getattr(terminalreporter, "_session", None)
+    if session is None:
+        return
+    passed, failed = _counts(session)
+    total = passed + len(failed)
+    terminalreporter.write_line(
+        f"Exit0: {passed} of {total} checks for {HERE.name.upper()} pass. "
+        "The result is saved in results.json next to the tests."
+    )
+'''
+
+def write_checks_conftest(root, task_id, spec):
+    """Only pytest runs get the trace. Other runners leave nothing for status to read."""
+    if not any("pytest" in str(part) for part in spec.get("run", [])):
+        return False
+    path = school_checks_dir(root, task_id) / "conftest.py"
+    path.write_text(CHECKS_CONFTEST, encoding="utf-8")
+    return True
+
+def read_results(root, task_id):
+    """The last recorded test run of a task, or None."""
+    raw = read_json(school_checks_dir(root, task_id) / "results.json", None)
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "passing": bool(raw.get("passing")),
+        "passed": raw.get("passed", 0),
+        "failed": raw.get("failed", 0),
+        "failedTests": raw.get("failedTests", []),
+        "ranAt": raw.get("ranAt"),
+    }
+
+def checks_command(root, task_id):
+    """The command the student runs for the task's tests, or None until they are downloaded."""
+    spec = read_checks_spec(root, task_id)
+    if not spec or not spec.get("run"):
+        return None
+    relative = f"tests/school-checks/{task_id.lower()}"
+    return " ".join(str(part).replace("{checks_dir}", relative) for part in spec["run"])
+
+def checks_facts(root, task):
+    """What status says about a task's tests: None when the catalog says it has none."""
+    if not task.get("checks", True):
+        return None
+    return {
+        "command": checks_command(root, task["id"]),
+        "lastRun": read_results(root, task["id"]),
+    }
+
+def questions_state(task, entry):
+    """None when the catalog says the task has no questions, else done or pending."""
+    if not task.get("questions", True):
+        return None
+    return "done" if entry.get("questionsRecorded") else "pending"
+
+def check_hashes(root, task_id):
+    """Names of check files whose contents no longer match checks.json."""
+    spec = read_checks_spec(root, task_id)
+    if not spec:
+        return []
+    checks = school_checks_dir(root, task_id)
+    drifted = []
+    for name, expected in spec.get("files", {}).items():
+        candidate = checks / name
+        if not candidate.exists() or sha256_file(candidate) != expected:
+            drifted.append(name)
+    return sorted(drifted)
+
+def run_checks(root, task_id):
+    """Run the task's checks. Returns (passed, combined_output)."""
+    spec = read_checks_spec(root, task_id)
+    if not spec or not spec.get("run"):
+        return False, "This task has no runnable checks."
+
+    checks = school_checks_dir(root, task_id)
+    command = [
+        part.replace("{checks_dir}", str(checks)) for part in spec["run"]
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "The checks took longer than 5 minutes and were stopped."
+    except OSError as exc:
+        return False, f"e0 could not run the checks: {exc}"
+
+    return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
+
+def download_checks(root, task_id, config):
+    """Fetch checks.json and all listed check files into tests/school-checks/{id}/."""
+    dest = school_checks_dir(root, task_id)
+    result = {"copied": [], "mismatched": []}
+
+    checks_text = fetch_text(
+        raw_content_url(config, f"tasks/{task_id.lower()}/checks/checks.json")
+    )
+    if checks_text is None:
+        return result
+
+    try:
+        spec = json.loads(checks_text)
+    except ValueError:
+        return result
+
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "checks.json").write_text(checks_text, encoding="utf-8")
+    result["copied"].append("checks.json")
+    if write_checks_conftest(root, task_id, spec):
+        result["copied"].append("conftest.py")
+
+    for name in spec.get("files", {}):
+        file_text = fetch_text(
+            raw_content_url(config, f"tasks/{task_id.lower()}/checks/{name}")
+        )
+        if file_text is not None:
+            (dest / name).write_text(file_text, encoding="utf-8")
+            result["copied"].append(name)
+            if sha256_file(dest / name) != spec["files"][name]:
+                result["mismatched"].append(name)
+
+    return result
+
+
+# ---------------------------------------------------------------- status
+
+def _stand(message, guidance=""):
+    """The student text and the agent's next step for one situation."""
+    return {"message": message, "guidance": guidance}
+
+def _pick_task(git, in_progress):
+    wanted = git.get("task")
+    if wanted:
+        for task in in_progress:
+            if task["id"] == wanted:
+                return task
+    if len(in_progress) == 1:
+        return in_progress[0]
+    return None
+
+def _on_main_continuation(git, in_progress, task):
+    n = git.get("unpushedCommits") or 0
+    if n > 0:
+        return (
+            "You committed on `main`. Here is what your repository looks like right now:\n\n"
+            "```\n"
+            "A --- B              origin/main: what GitHub has\n"
+            "       \\\n"
+            f"        C            main on your computer: {n} commit(s) GitHub does not have\n"
+            "```\n\n"
+            "Nothing is lost. You can choose:\n\n"
+            "1. **Move the commits** to a new feature branch for this task, and put `main` back "
+            "to what GitHub has.\n"
+            "2. **Drop the commits** and put `main` back to what GitHub has. Your files go back "
+            "to `main`'s version.\n\n"
+            "Which one?"
+        )
+    uncommitted = git.get("uncommitted") or []
+    if uncommitted:
+        files = ", ".join(f"`{name}`" for name in uncommitted)
+        return (
+            f"You changed {files} but did not **commit** them yet, so nothing is lost and "
+            "nothing is decided. Two ways out, you choose:\n\n"
+            "1. **Keep the changes** and take them with you into a new feature branch. Git "
+            "carries uncommitted edits along when you create a branch.\n"
+            "2. **Throw the changes away** and start clean on a new feature branch.\n\n"
+            "Which one?"
+        )
+    wanted = task["id"] if task else None
+    for branch in git.get("branches") or []:
+        if not branch.get("task"):
+            continue
+        if wanted and branch["task"] != wanted:
+            continue
+        if any(item["id"] == branch["task"] for item in in_progress):
+            name = branch["name"]
+            return (
+                f"You already have a branch for this task: `{name}`. Let's go back to it:\n"
+                f"```bash\ngit checkout {name}\n```\n"
+                "Your work there is waiting for you. If you would rather start over on a fresh "
+                "branch, tell me and we will make one."
+            )
+    return (
+        "To create your branch from an up-to-date `main`:\n"
+        "```bash\n"
+        "git checkout main\n"
+        "git pull origin main\n"
+        "git checkout -b <task-branch>\n"
+        "```\n"
+        "Replace `<task-branch>` with a meaningful name for this task."
+    )
+
+def _task_branch_example(task):
+    slug = title_slug(task.get("title") or "")
+    prefix = task["id"].lower()
+    return f"{prefix}-{slug}" if slug else prefix
+
+def _work_on_branch_message(git, task):
+    branch = git.get("branch") or "this branch"
+    url = (task.get("issue") or {}).get("url") or ""
+    tid, title = task["id"], task["title"]
+    link = f"[{tid}/task.md](content/{tid.lower()}/task.md)"
+    commits = git.get("branchCommits") or 0
+    uncommitted = git.get("uncommitted") or []
+    if commits == 0 and not uncommitted:
+        return (
+            f"You are on the branch `{branch}`, ready for {tid}: {title} ({url}). "
+            f"Want to start working on it? Tell me what you have in mind, or ask me anything "
+            f"about the task: {link}."
+        )
+    parts = []
+    if commits:
+        parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+    if uncommitted:
+        files = ", ".join(f"`{name}`" for name in uncommitted)
+        parts.append(f"edits not committed yet in {files}")
+    return (
+        f"You are on `{branch}` for {tid}: {title} ({url}), with {' and '.join(parts)}. "
+        "Want to keep working on it?"
+    )
+
+def _last_run(task):
+    checks = task.get("checks") if isinstance(task.get("checks"), dict) else None
+    if not checks:
+        return None
+    return checks.get("lastRun") or None
+
+def _last_run_passing(task):
+    last = _last_run(task) or {}
+    return bool(last.get("passing"))
+
+def _needs_push(git):
+    """Nothing is on GitHub yet, or the computer has commits or edits GitHub lacks."""
+    unpushed = git.get("unpushedCommits")
+    return bool(git.get("uncommitted")) or unpushed is None or unpushed > 0
+
+def _push_message(git):
+    branch = git.get("branch") or "your-branch"
+    uncommitted = git.get("uncommitted") or []
+    parts = []
+    if uncommitted:
+        files = " ".join(uncommitted)
+        parts.append(
+            f"You have edits not committed yet: {files}. Let's save them first:\n"
+            "```bash\n"
+            f"git add {files}\n"
+            'git commit -m "{line: a short line on what changed}"\n'
+            "```"
+        )
+    parts.append(
+        "Your work lives only on your computer so far. Time to **push** (f.t.t. push sends the "
+        "commits of your branch to the remote, origin, so GitHub has a copy too):\n"
+        "```bash\n"
+        f"git push -u origin {branch}\n"
+        "```\n"
+        "`-u` tells Git that this branch on GitHub is the twin of your local one; from now on a "
+        "plain `git push` is enough. Tell me when it is done."
+    )
+    return "\n\n".join(parts)
+
+def _open_pr_message(git, task):
+    branch = git.get("branch") or "your-branch"
+    issue = (task.get("issue") or {}).get("number")
+    closes = f"#{issue}" if issue else "#<issue number>"
+    tid, title = task["id"], task.get("title") or ""
+    return (
+        f"Now, [open a pull request](content/knowledge-base/pull-requests.md) from `{branch}` "
+        "into `main`. A **pull request** (f.t.t. a pull request is a request to merge your "
+        "branch into main: the team sees the change, the tests run on it, and someone reviews "
+        "it before it goes in) is how work reaches production in every team. The link explains "
+        "it and shows how to open one on GitHub, step by step. "
+        f"Name it `[{tid}] {title}`, and write `Closes {closes}` in the description so GitHub "
+        "links it to your issue. Tell me when it is open."
+    )
+
+def _ship_stand(git, task):
+    """Tests passed, or the student confirmed a task that has no automatic tests."""
+    if _needs_push(git):
+        return _stand(
+            _push_message(git),
+            "Fill the {line} blank in the commit command when it is there. "
+            "When they say the push is done, run `e0 status`.",
+        )
+    return _stand(
+        _open_pr_message(git, task),
+        "Before you send, run `e0 read pull-requests` and write `data.tutorial` to "
+        "`content/knowledge-base/pull-requests.md`, so the link works. If the course has no such "
+        "topic, leave the link out. When they say it is open, run `e0 status`.",
+    )
+
+def _run_tests_message(command):
+    return (
+        "Before we send your work in, let's run the tests. Every task comes with "
+        "**school checks** (f.t.t. school checks are small automatic tests that say whether "
+        "your code does what the task asks). Run:\n"
+        "```bash\n"
+        f"{command}\n"
+        "```\n"
+        "Then tell me how it went. The run saves its result, so I can see it too."
+    )
+
+def _run_tests_stand(task):
+    command = (task.get("checks") or {}).get("command")
+    if not command:
+        return _stand(
+            "",
+            f"The test command is not on disk yet. Run `e0 task {task['id']}` and write the task "
+            "file, silently, then run `e0 status --done` again. Send nothing until then.",
+        )
+    return _stand(
+        _run_tests_message(command),
+        "When they report back, run `e0 status`.",
+    )
+
+def _tests_failed_message(task):
+    last = _last_run(task) or {}
+    passed = last.get("passed") or 0
+    failed = last.get("failed") or 0
+    names = last.get("failedTests") or []
+    listed = ", ".join(names) if names else "their names are in the output"
+    return (
+        f"{failed} of {passed + failed} checks fail: {listed}. "
+        "{line: one line per failing test on what it expects, from its name and the task} "
+        "Let's look at the code together. Where do you want to start? "
+        "You can also paste the error you got."
+    )
+
+def pick_stand(git, in_progress, ready, completed, done=False, ship=False):
+    """The first deterministic situation, with the student text filled in. Conversation-only
+    cases (first-task walk, checkout aborted) stay in the skill. `done` means the student
+    says the work is finished. `ship` means they confirmed a task with no automatic tests."""
+    pending = [task for task in completed if task.get("questions") == "pending"]
+    if pending:
+        task_id = pending[0]["id"]
+        return _stand(
+            f"Before we move on, a few questions about what you built in {task_id}. They are "
+            "not a test; they help the ideas stick. Ready?",
+            f"Run `e0 questions {task_id}`. Ask the questions one at a time, as the learning "
+            f"skill's Comprehension questions section says. When the set is done, or they "
+            f"decline, record it with `e0 record {task_id} <<'EOF'`. The comment on the issue "
+            "is the record.",
+        )
+    if not in_progress:
+        where = (
+            "Nothing is in progress yet."
+            if not completed
+            else f"{len(completed)} task{'s' if len(completed) != 1 else ''} done, nothing in progress right now."
+        )
+        offer = (
+            " Ready to start: " + ", ".join(f"{task['id']}: {task['title']}" for task in ready) + "."
+            if ready
+            else ""
+        )
+        return _stand(
+            f"{where}{offer} Want to start one, or hear more about one first?",
+        )
+    task = _pick_task(git, in_progress)
+    pr = (task or {}).get("pr") if task else None
+    if task and pr and pr.get("merged"):
+        issue = task.get("issue") or {}
+        return _stand(
+            f"Your pull request is merged: {task['id']} is part of `main` now. 🎉 One last thing: "
+            f"close the issue {issue.get('url') or ''}, on GitHub or with:\n"
+            f"```bash\ngh issue close {issue.get('number')}\n```\n"
+            "A closed issue is how we mark a task complete. Tell me when it is done.",
+        )
+    if task and pr and str(pr.get("state") or "").upper() == "OPEN":
+        url = pr.get("url") or ""
+        checks = pr.get("checks")
+        if checks in ("failing", "pending"):
+            if checks == "pending":
+                message = (
+                    f"Your pull request is open: {url}. The checks on it are still running. **CI** "
+                    "(f.t.t. CI, continuous integration, is a service that runs the tests on every "
+                    "push, so a broken change is caught before it is merged) runs the same school "
+                    "checks you ran. Give it a minute, then tell me."
+                )
+            else:
+                branch = pr.get("branch") or git.get("branch") or "your branch"
+                message = (
+                    f"Your pull request is open: {url}, but its checks are red. **CI** (f.t.t. CI, "
+                    "continuous integration, is a service that runs the tests on every push, so a "
+                    "broken change is caught before it is merged) ran the school checks on your "
+                    "branch, and some fail. A pull request is merged only when its checks pass; that "
+                    "is the rule in every team, and here too. On the pull request page, click "
+                    f"**Details** next to the red cross and read which test failed. Fix it on `{branch}`, "
+                    "commit, push, and the pull request updates itself. Want to look at the failing "
+                    "test together?"
+                )
+            return _stand(
+                message,
+                "Do this before you run or fix anything. The fix is the student's.",
+            )
+        if not pr.get("reviews"):
+            task_id = task["id"]
+            return _stand(
+                f"I reviewed your pull request against the rules of this task and left my notes "
+                f"there: {url}. {{line: one or two sentences on what is good, and what to change, if anything}} "
+                "Read the comments. If something needs a change: fix it, commit, push, and tell me; "
+                "the pull request updates itself and I will look again. If nothing does, you can merge.",
+                f"Review now; the student does not need to ask. Run `e0 review {task_id}`. "
+                "`data.diff` is the pull request; `data.rules.course` and `data.rules.task` are the "
+                "whole standard. Write the review in Markdown: each rule, nothing else. Heading "
+                f"`## Review of {task_id}`, one bullet per rule (met or not, and the line that shows "
+                f"it), close with what to change or \"Nothing to change\". Post with "
+                f"`e0 review {task_id} --post <<'EOF'` ... `EOF`. Each rule only: no general best practices, "
+                "never a file. Fill the {line} blank from the review. "
+                "They may ask again after changes: same way.",
+            )
+        return _stand(
+            f"Your pull request has my review on it: {url}. Did you go through the comments? If "
+            "something still needs a change: fix it, commit, push, and tell me, and I will review "
+            "again. If it is all good: **merge** it. On the pull request page, click **Merge pull request**, "
+            "then **Confirm merge**. Delete the branch when GitHub offers; its work is in `main` now. "
+            "Then tell me.",
+        )
+    if git.get("branch") == "main" and in_progress:
+        opening = (
+            "You are on the `main` branch, and we never work on it directly, remember? In a "
+            "real-life project no one will let you work directly on `main`: it is the **production** "
+            "branch. You work on each task on its own **feature branch**, then merge it into `main` "
+            "through a **pull request**, so it passes the CI checks and a review."
+        )
+        if len(in_progress) > 1:
+            listed = ", ".join(
+                f"{item['id']}: {item['title']} ({(item.get('issue') or {}).get('url') or ''})"
+                for item in in_progress
+            )
+            opening += (
+                f" {len(in_progress)} tasks are in progress ({listed}). Which one are you working on now?"
+            )
+        elif task:
+            url = (task.get("issue") or {}).get("url") or ""
+            opening += f" The open task is {task['id']}: {task['title']} ({url})."
+        return _stand(
+            opening + "\n\n" + _on_main_continuation(git, in_progress, task),
+            "If they choose: move commits = `git branch <task-branch>`, "
+            "`git reset --keep origin/main`, `git checkout <task-branch>`; drop commits = "
+            "`git reset --keep origin/main`; keep uncommitted = `git checkout -b <task-branch>`; "
+            "throw away = `git restore .` then `git checkout -b <task-branch>`.",
+        )
+    branch = git.get("branch") or ""
+    if "<" in branch or ">" in branch:
+        return _stand(
+            "You included the `<` `>` in the branch name by mistake. Throughout the course `<` "
+            "and `>` mark a placeholder; the brackets are not part of the name. No harm done, "
+            "renaming is one command, and it matters because the team will see this name:\n"
+            "```bash\ngit branch -m <task-branch>\n```",
+            "Keep `git branch -m <task-branch>` as is; they "
+            "replace the placeholder with a meaningful name.",
+        )
+    if len(in_progress) > 1 and git.get("task") is None:
+        listed = ", ".join(
+            f"{item['id']} ({(item.get('issue') or {}).get('url') or ''})" for item in in_progress
+        )
+        return _stand(
+            f"You are on the branch `{branch}`. {len(in_progress)} tasks are in progress ({listed}), "
+            f"and the name `{branch}` does not tell me which one this branch is for. Which task are "
+            "you working on now?\n\nA branch name that says the task, like the task id and a word or "
+            "two from its title, helps both of us: I can see what you work on, and so can your "
+            "teammates. Once you tell me the task, we either rename this branch for it or create a "
+            "fresh one.",
+            "Once they name the task: work on this branch is "
+            "`git branch -m <task-branch>`; otherwise a new branch from an up-to-date main.",
+        )
+    if git.get("task") is None:
+        example = _task_branch_example(task) if task else "t010-say-hello"
+        return _stand(
+            f"The name `{branch}` says nothing about the task. A good name is short, lowercase, "
+            f"hyphens, and says which task: `{example}`. The whole team reads it. Rename with:\n"
+            "```bash\ngit branch -m <task-branch>\n```",
+            "Keep the placeholder; they pick the name.",
+        )
+    if task and (_last_run_passing(task) or (ship and task.get("checks") is None)):
+        return _ship_stand(git, task)
+    if task and done and task.get("checks") is None:
+        return _stand(
+            "This task has no automatic tests, so you are the judge. Is it done?",
+            "If they say yes, run `e0 status --ship` and say that message.",
+        )
+    if task and done and task.get("checks"):
+        return _run_tests_stand(task)
+    if task and _last_run(task) and not _last_run_passing(task):
+        return _stand(
+            _tests_failed_message(task),
+            "Fill the {line} blank: one line per failing test on what it expects. Then help "
+            "with the code. "
+            "`e0 check` runs the same tests when you need the output yourself. When they are "
+            "ready to run the tests again, run `e0 status --done`.",
+        )
+    if task:
+        tid = task["id"]
+        return _stand(
+            _work_on_branch_message(git, task),
+            "If "
+            f"`content/{tid.lower()}/task.md` is missing, run `e0 task {tid}` and write it first, "
+            "silently. Then the conversation is about their code. Never start implementing on your own; "
+            "when they ask, help as a regular coding agent would. Leave the workflow until they say "
+            "they finished or ask what is next: run `e0 status --done`.",
+        )
+    return None
+
+def prepend_notes(message, warnings):
+    """Student warnings first, then the situation text. Same join status and start use."""
+    notes = [item["message"] for item in warnings if item.get("message")]
+    if not notes:
+        return message
+    head = "\n\n".join(notes)
+    return head + ("\n\n" + message if message else "")
+
+def cmd_status(args):
+    root, failure = require_repo("status")
+    if failure:
+        return failure
+
+    git = git_facts(root)
+    if git["conflicts"]:
+        return merge_conflict_problem("status", git)
+
+    catalog, failure = require_content("status", root)
+    if failure:
+        return failure
+
+    progress, failure = require_progress("status", root, catalog)
+    if failure:
+        return failure
+    statuses = statuses_from(progress)
+
+    def with_github(task):
+        entry = progress[task["id"]]
+        return {**task_summary(task), "issue": entry["issue"], "pr": entry["pr"]}
+
+    # A task in progress carries its tests (the command, the last recorded run); a complete
+    # one carries whether its comprehension questions were recorded on the issue.
+    in_progress = [
+        {**with_github(task), "checks": checks_facts(root, task)}
+        for task in tasks_in_progress(catalog, statuses)
+    ]
+    ready = [task_summary(task) for task in available_tasks(catalog, statuses)]
+    completed = [
+        {**with_github(task), "questions": questions_state(task, progress[task["id"]])}
+        for task in ordered_tasks(catalog)
+        if statuses.get(task["id"]) == "complete"
+    ]
+
+    git = git_facts(root, in_progress)
+
+    # The protocol for a task: open issue -> feature branch -> PR into main -> checks pass ->
+    # PR merged -> issue closed -> comprehension questions. A closed issue with no merged PR
+    # means a step was skipped. The student may do that; the agent must say so. A warning's
+    # message is written for the student: the agent sends it as it is.
+    warnings = [
+        {
+            "kind": "closed_without_pr",
+            "taskId": task["id"],
+            "message": (
+                f"The issue of {task['id']} is closed, but no merged pull request is linked to "
+                f"it, so {task['id']} counts as complete. The usual road has a pull request, "
+                "passing checks, and a review. If the work is not done, you can reopen the issue "
+                f"with `gh issue reopen {task['issue']['number']}`. Or move on: your call."
+            ),
+        }
+        for task in completed
+        if not (task["pr"] and task["pr"]["merged"])
+    ]
+
+    # A task started before the tasks it builds on are done. The student may do that too;
+    # the agent says which tasks were skipped, once, until the student asks to drop it.
+    dismissed = read_dismissed(root)
+    for task in in_progress:
+        missing = unmet_dependencies(find_task(catalog, task["id"]), statuses)
+        if missing and task["id"] not in dismissed:
+            warnings.append({**dependency_warning(task["id"], missing), "taskId": task["id"]})
+
+    def names(tasks):
+        return ", ".join(
+            f"{task['id']}: {task['title']}"
+            + (f" ({task['issue']['url']})" if task.get("issue") else "")
+            for task in tasks
+        )
+
+    stand = pick_stand(
+        git, in_progress, ready, completed, done="--done" in args, ship="--ship" in args
+    ) or {}
+    if stand:
+        message = stand["message"]
+        guidance = stand["guidance"]
+    elif in_progress and ready:
+        message = f"You are working on {names(in_progress)}. Also ready to start: {names(ready)}."
+        guidance = ""
+    elif in_progress:
+        message = f"You are working on {names(in_progress)}. The next tasks build on it."
+        guidance = ""
+    elif ready:
+        message = f"Nothing in progress. Ready to start: {names(ready)}."
+        guidance = ""
+    elif len(completed) == len(catalog.get("tasks", [])):
+        message = "Every task is complete."
+        guidance = ""
+    else:
+        message = "Nothing in progress and nothing is ready to start."
+        guidance = ""
+
+    message = prepend_notes(message, warnings)
+    if any(item.get("kind") == "dependency" for item in warnings):
+        guidance = (
+            "If they choose to skip the unfinished tasks, run `e0 dismiss` with the task id. "
+            + guidance
+        ).strip()
+
+    data = {
+        "inProgress": in_progress,
+        "ready": ready,
+        "completed": completed,
+        "git": git,
+    }
+    return reply("status", data, message, guidance)
+
+def cmd_dismiss(args):
+    """Silence the dependency reminder of a task the student chose to work on out of order."""
+    root, catalog, task, failure = resolve_task("dismiss", args)
+    if failure:
+        return failure
+    until = datetime.date.today() + datetime.timedelta(days=DISMISS_DAYS)
+    dismissed = read_dismissed(root)
+    dismissed[task["id"]] = until.isoformat()
+    write_dismissed(root, dismissed)
+    return reply(
+        "dismiss",
+        {"taskId": task["id"], "until": until.isoformat()},
+        f"I won't remind you that {task['id']} builds on unfinished tasks until {until.isoformat()}.",
+    )
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_help(args):
+    return reply(
+        "help",
+        {"commands": sorted(COMMANDS)},
+        guidance="Commands are in data.commands.",
+    )
+
+def cmd_init(args):
+    root, failure = require_repo("init")
+    if failure:
+        return failure
+
+    config = read_config(root)
+    if not config.get("courseContentRepo"):
+        return problem(
+            "init",
+            "e0 cannot find the course content repo.",
+            "Check that .exit0/config.json exists and has a 'courseContentRepo' key.",
+            tell=True,
+        )
+
+    catalog_text = fetch_text(raw_content_url(config, "catalog.json"))
+    if catalog_text is None:
+        return problem(
+            "init",
+            "e0 could not download the course catalog.",
+            "Check your internet connection and the 'courseContentRepo' in .exit0/config.json.",
+            tell=True,
+        )
+
+    try:
+        catalog = json.loads(catalog_text)
+    except ValueError:
+        return problem(
+            "init",
+            "The course catalog is not valid JSON.",
+            "This is a problem with the course itself. Please report it.",
+            tell=True,
+        )
+
+    (exit0_dir(root) / "catalog.json").write_text(catalog_text, encoding="utf-8")
+
+    profile = read_profile(root) or detect_profile(root)
+    write_profile(root, profile)
+
+    (pathlib.Path(root) / "content").mkdir(exist_ok=True)
+    (pathlib.Path(root) / "tests" / "school-checks").mkdir(parents=True, exist_ok=True)
+
+    download_skills(root, config, catalog)
+
+    course = catalog.get("course", {})
+    tasks = catalog.get("tasks", [])
+
+    return reply(
+        "init",
+        {
+            "course": course,
+            "profile": profile,
+            "taskCount": len(tasks),
+        },
+        f"Ready. {course.get('title', 'The course')} has {len(tasks)} tasks.",
+    )
+
+def cmd_profile(args):
+    root, failure = require_repo("profile")
+    if failure:
+        return failure
+
+    action = args[0] if args else "get"
+    profile = read_profile(root) or detect_profile(root)
+
+    if action == "get":
+        return reply(
+            "profile",
+            {"profile": profile},
+            guidance="The profile is in data.profile. The student does not need to hear it.",
+        )
+
+    if action == "set":
+        if len(args) < 3:
+            return problem(
+                "profile",
+                "e0 profile set needs two things: a key and a value.",
+                "Use: e0 profile set <key> <value>",
+            )
+        key, value = args[1], args[2]
+        profile[key] = value
+        write_profile(root, profile)
+        return reply(
+            "profile",
+            {"profile": profile},
+            guidance=f"Recorded {key}={value}. The student does not need to hear it.",
+        )
+
+    return problem(
+        "profile",
+        f"'{action}' is not a profile command.",
+        "Use 'e0 profile get' or 'e0 profile set <key> <value>'.",
+    )
+
+def cmd_catalog(args):
+    root, catalog, failure = require_catalog("catalog")
+    if failure:
+        return failure
+
+    progress, failure = require_progress("catalog", root, catalog)
+    if failure:
+        return failure
+    statuses = statuses_from(progress)
+    # Every field the course author put in the catalog passes through untouched, so new
+    # kinds of information (purpose, learning goals, ...) reach the agent with no e0 change.
+    tasks = [
+        {**task, "status": statuses.get(task["id"], "not_started")}
+        for task in ordered_tasks(catalog)
+    ]
+
+    done = sum(1 for task in tasks if task["status"] == "complete")
+    return reply(
+        "catalog",
+        {"course": catalog.get("course", {}), "tasks": tasks},
+        guidance=f"{len(tasks)} tasks, {done} complete. Answer the student from data.tasks.",
+    )
+
+def read_body_stdin(command, usage, what):
+    """The text the agent piped in for e0 to post. It never touches the student's disk.
+    Returns (text, None) or (None, problem)."""
+    text = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+    if not text.strip():
+        return None, problem(
+            command,
+            f"e0 {command} got no text on its input, so there is nothing to post.",
+            f"Pass {what} through a quoted heredoc: {usage} <<'EOF' ... EOF",
+        )
+    return text, None
+
+def write_task_file(root, task_id, canonical_text):
+    """Check the personalized text the agent piped in against the original, and write it to
+    content/<id>/task.md only when every protected part is intact. Overwrites an old file."""
+    usage = f"e0 task {task_id} --write"
+    text, failure = read_body_stdin("task", usage, "the personalized task")
+    if failure:
+        return failure
+
+    path = f"content/{task_id.lower()}/task.md"
+    result = verify_document(canonical_text, text)
+    if result["violations"]:
+        return problem(
+            "task",
+            "The personalized task changed text it is not allowed to change, so e0 did not "
+            "write it. " + " ".join(v["message"] for v in result["violations"]),
+            f"Personalize again from data.canonical of 'e0 task {task_id}': keep one branch "
+            "per variant, fill retone blocks only when asked, change nothing else, remove the "
+            f"markers. Then pipe it to '{usage}' again. The student hears nothing about this.",
+            data={"violations": result["violations"]},
+        )
+
+    task_path = task_content_dir(root, task_id) / "task.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(text, encoding="utf-8")
+    return reply(
+        "task",
+        {"taskId": task_id, "violations": [], "path": path},
+        guidance=f"The task file follows the rules. e0 wrote it to {path}. The student hears nothing about this.",
+    )
+
+def cmd_task(args):
+    """Fetch a task for the agent: the canonical text, what may be personalized, the checks.
+    Starts nothing, so it is safe when the student only wants to hear about a task. With
+    --write, verify the personalized text the agent pipes in and write it to the task file."""
+    root, catalog, task, failure = resolve_task("task", args)
+    if failure:
+        return failure
+
+    task_id = task["id"]
+    canonical_text, failure = fetch_canonical("task", root, task_id)
+    if failure:
+        return failure
+
+    if "--write" in args[1:]:
+        return write_task_file(root, task_id, canonical_text)
+
+    warnings = []
+    checks = download_checks(root, task_id, read_config(root))
+    for name in checks["mismatched"]:
+        warnings.append(
+            {
+                "kind": "check_hash",
+                "message": f"The check file {name} does not match its published hash.",
+            }
+        )
+
+    profile = read_profile(root) or detect_profile(root)
+    try:
+        payload = personalization_payload(canonical_text, profile)
+    except MarkerError as exc:
+        payload = {"variants": [], "retoneBlocks": [], "facts": {}}
+        warnings.append(
+            {
+                "kind": "markers",
+                "message": f"The personalization markers in this task have a problem ({exc}). "
+                "The task text is still correct. Write it as it is, without the markers.",
+            }
+        )
+
+    # Progress is nice to have here, not required: "tell me about T020" must work even when
+    # gh is not set up yet.
+    progress, error = github_progress(root, catalog)
+    if progress is None:
+        statuses = {}
+        status = "unknown"
+        warnings.append(
+            {
+                "kind": "progress",
+                "message": f"e0 could not read the GitHub issues of this repo ({error}), "
+                "so it does not know whether this task was started.",
+            }
+        )
+    else:
+        statuses = statuses_from(progress)
+        status = statuses.get(task_id, "not_started")
+
+    unmet = unmet_dependencies(task, statuses)
+    guidance = (
+        f"The original text of {task_id} is in data.canonical. Apply data.personalization "
+        f"and pipe the clean Markdown to 'e0 task {task_id} --write', which checks it and "
+        f"writes content/{task_id.lower()}/task.md. "
+        "data.task answers questions about the task. Nothing was started. "
+        "The student hears nothing about this."
+    )
+    if unmet:
+        guidance += (
+            f" {task_id} builds on {', '.join(unmet)}, not complete yet: if the student asks "
+            f"to start {task_id}, start {task_id} itself, never another task in its place."
+        )
+    notes = [item["message"] for item in warnings if item.get("message")]
+    if notes:
+        guidance += " " + " ".join(notes)
+
+    return reply(
+        "task",
+        {
+            "taskId": task_id,
+            "task": task,
+            "canonical": canonical_text,
+            "personalization": payload,
+            "paths": task_paths(task_id),
+            "status": status,
+            "unmetDependencies": unmet,
+        },
+        guidance=guidance,
+    )
+
+def _start_message(task_id, url, first_task):
+    """The note the student hears when a task opens. The first task already includes
+    the Git opening and step 1, so the agent does not choose a version."""
+    link = f"[{task_id}/task.md](content/{task_id.lower()}/task.md)"
+    head = (
+        f"Your task is ready: {link}. The GitHub issue for it: {url}\n"
+        "\n"
+        "💡 Tip: with the file open, press `Ctrl+Shift+V` (`Cmd+Shift+V` on macOS) "
+        "to read it in Markdown preview.\n"
+        "\n"
+    )
+    if not first_task:
+        return head + (
+            "Your first move is a branch for this task, from an up-to-date `main`:\n"
+            "```bash\n"
+            "git checkout main\n"
+            "git pull origin main\n"
+            "git checkout -b <task-branch>\n"
+            "```\n"
+            "{line: why main stays clean, and this work comes back as a pull request}"
+        )
+    return head + (
+        "**Using Git**: Engineering teams use a tool called **Git** to work on the same "
+        "codebase together without stepping on each other's toes. A code project is a "
+        "collection of files, and if two people edit the same file at the same time, they "
+        "can overwrite each other's work. Git lets each developer work on their own "
+        "**branch**. On a branch, your changes are separate and safe. When you are ready, "
+        "you **merge** your branch into the **main branch**. This is how many developers "
+        "work on one project without interfering with each other.\n"
+        "\n"
+        "We will use Git on every task in this course. It is one of the most important "
+        "tools in a developer's toolbox.\n"
+        "\n"
+        "Don't worry if this is not all clear yet. We will go through it together. For now, "
+        "we need one thing: your own branch (a **feature branch**) to work on this task.\n"
+        "\n"
+        "Every task starts from the **main branch**. It holds the code that runs in "
+        "**production** (f.t.t. production is the environment where the real product runs "
+        "and real people use it). Let's switch to it. Run this command (you are probably "
+        "on it already):\n"
+        "```bash\n"
+        "git checkout main\n"
+        "```"
+    )
+
+def cmd_start(args):
+    """Start a task: open the GitHub issue that marks it as in progress, on `origin`, with
+    the task file `e0 task --write` checked and wrote as its body."""
+    root, catalog, task, failure = resolve_task("start", args)
+    if failure:
+        return failure
+
+    task_id = task["id"]
+    progress, failure = require_progress("start", root, catalog)
+    if failure:
+        return failure
+    statuses = statuses_from(progress)
+
+    if task_id in progress:
+        state = progress[task_id]["state"]
+        issue = progress[task_id]["issue"]
+        return problem(
+            "start",
+            f"{task_id} is already {'in progress' if state == 'in_progress' else 'complete'}: "
+            f"issue #{issue['number']} ({issue['url']}).",
+            "Run 'e0 status' and say its message.",
+            tell=True,
+        )
+
+    task_path = task_content_dir(root, task_id) / "task.md"
+    if not task_path.exists():
+        return problem(
+            "start",
+            f"The task file content/{task_id.lower()}/task.md does not exist yet.",
+            f"Run 'e0 task {task_id}', personalize data.canonical, pipe it to "
+            f"'e0 task {task_id} --write', then run 'e0 start {task_id}' again.",
+        )
+
+    personalized_text = task_path.read_text(encoding="utf-8")
+    download_checks(root, task_id, read_config(root))
+
+    title = f"[{task_id}] {task['title']}"
+    out, error = gh_body(root, personalized_text, "issue", "create", "--title", title)
+    if error:
+        return github_problem("start", root, f"e0 could not open the issue of {task_id}", error)
+    url = out.splitlines()[-1].strip() if out else ""
+    number = url.rstrip("/").rsplit("/", 1)[-1]
+    issue = {"number": int(number) if number.isdigit() else None, "url": url, "title": title}
+
+    warnings = []
+    missing = unmet_dependencies(task, statuses)
+    if missing:
+        warnings.append(dependency_warning(task_id, missing))
+    code, out, _ = run_git(root, "remote")
+    if code == 0 and len(out.split()) > 1:
+        warnings.append(
+            {
+                "kind": "multiple_remotes",
+                "message": (
+                    f"I opened the issue on `origin` ({origin_repo(root)}): your repo has more "
+                    "than one remote, and the course always works with `origin`."
+                ),
+            }
+        )
+
+    first_task = not progress
+    message = prepend_notes(_start_message(task_id, url, first_task), warnings)
+    guidance = ""
+    if any(item.get("kind") == "dependency" for item in warnings):
+        guidance = (
+            f"If they choose to skip the unfinished tasks, run `e0 dismiss {task_id}`. "
+            "Then keep going with this task."
+        )
+    if first_task:
+        guidance = (
+            guidance + " After they run the checkout, continue from step 2 of "
+            "The branch, step by step in .exit0/skills/learning/references/git.md. "
+            "One step per message."
+        ).strip()
+
+    return reply(
+        "start",
+        {
+            "taskId": task_id,
+            "task": task,
+            "paths": task_paths(task_id),
+            "firstTask": first_task,
+            "issue": issue,
+        },
+        message,
+        guidance,
+    )
+
+def cmd_check(args):
+    root, catalog, failure = require_catalog("check")
+    if failure:
+        return failure
+
+    if args:
+        task = find_task(catalog, args[0])
+        if task is None:
+            return problem(
+                "check",
+                f"There is no task called '{args[0]}'.",
+                "Run 'e0 catalog' to see the task ids.",
+            )
+        task_id = task["id"]
+    else:
+        progress, failure = require_progress("check", root, catalog)
+        if failure:
+            return failure
+        in_progress = tasks_in_progress(catalog, statuses_from(progress))
+        if not in_progress:
+            return problem(
+                "check",
+                "No task is in progress. e0 does not know what to check.",
+                "Use 'e0 check <taskId>', or start a task first with 'e0 start <taskId>'.",
+            )
+        task_id = in_progress[0]["id"]
+
+    if not school_checks_dir(root, task_id).exists():
+        return problem(
+            "check",
+            f"The checks for {task_id} have not been downloaded yet.",
+            f"Run 'e0 task {task_id}' first. It downloads them.",
+        )
+
+    warnings = [
+        {
+            "kind": "check_hash",
+            "message": f"{name} does not match the version that was published. "
+            "Your local result might be wrong. CI always uses the original.",
+        }
+        for name in check_hashes(root, task_id)
+    ]
+
+    passed, output = run_checks(root, task_id)
+
+    data = {
+        "taskId": task_id,
+        "passed": passed,
+        "output": output,
+        "warnings": warnings,
+    }
+
+    note = " ".join(item["message"] for item in warnings)
+    if passed:
+        return reply(
+            "check",
+            data,
+            f"All checks for {task_id} pass.",
+            guidance=note,
+        )
+
+    return problem(
+        "check",
+        f"The checks for {task_id} are not passing yet.",
+        "Read data.output. Help the student fix the code, then run 'e0 check' again. " + note,
+        data=data,
+        tell=True,
+    )
+
+def cmd_read(args):
+    root, catalog, failure = require_catalog("read")
+    if failure:
+        return failure
+
+    config = read_config(root)
+    if not args:
+        index_text = fetch_text(raw_content_url(config, "knowledgebase/index.json"))
+        topics = []
+        if index_text:
+            try:
+                topics = json.loads(index_text).get("topics", [])
+            except ValueError:
+                pass
+        return reply(
+            "read",
+            {"topics": topics},
+            guidance="Topics are in data.topics. Use 'e0 read <topic>' for one tutorial.",
+        )
+
+    topic = args[0]
+    tutorial_text = fetch_text(
+        raw_content_url(config, f"knowledgebase/{topic}/tutorial.md")
+    )
+    if tutorial_text is None:
+        return problem(
+            "read",
+            f"e0 could not download the tutorial for '{topic}'.",
+            "Run 'e0 read' with no topic to see which tutorials exist.",
+            tell=True,
+        )
+
+    return reply(
+        "read",
+        {
+            "topic": topic,
+            "tutorial": tutorial_text,
+            "suggestedPath": f"content/knowledge-base/{topic}.md",
+        },
+        guidance=(
+            f"Write data.tutorial to content/knowledge-base/{topic}.md, then link that file. "
+            "The student hears the tutorial, not this reply."
+        ),
+    )
+
+
+# ---------------------------------------------------------------- review and questions
+
+def require_pr(command, task, progress):
+    """Return (pr, None) or (None, problem_payload). The PR is the student's to open."""
+    entry = progress.get(task["id"])
+    if not entry or not entry["pr"]:
+        return None, problem(
+            command,
+            f"{task['id']} has no pull request yet.",
+            "The student opens a pull request from the task branch into main. "
+            "Then run this command again.",
+            tell=True,
+        )
+    return entry["pr"], None
+
+def cmd_review(args):
+    """Hand the agent what a review needs: the PR diff and the rules of this task. The rules
+    are the whole standard: the review checks them and nothing else. With --post, post the
+    review the agent wrote, read from stdin, on the pull request."""
+    post = "--post" in args
+    args = [arg for arg in args if arg != "--post"]
+    root, catalog, task, failure = resolve_task("review", args)
+    if failure:
+        return failure
+    progress, failure = require_progress("review", root, catalog)
+    if failure:
+        return failure
+    pr, failure = require_pr("review", task, progress)
+    if failure:
+        return failure
+    if post:
+        return post_review(root, task, pr)
+    if pr["checks"] in ("failing", "pending"):
+        return problem(
+            "review",
+            f"The CI checks of pull request #{pr['number']} are {pr['checks']}, so it is not ready "
+            "for a review.",
+            "A pull request is reviewed once its checks pass. Run `e0 status` and say its "
+            "message. The fix is the student's to make and push; then run this command again.",
+        )
+
+    config = read_config(root)
+    task_id = task["id"]
+    rules = {
+        "course": fetch_text(raw_content_url(config, "rules.md")) or "",
+        "task": fetch_text(raw_content_url(config, f"tasks/{task_id.lower()}/rules.md")) or "",
+    }
+    diff, error = pr_diff(root, pr)
+    if diff is None:
+        return github_problem(
+            "review", root, f"e0 could not read the diff of pull request #{pr['number']}", error
+        )
+
+    return reply(
+        "review",
+        {"taskId": task_id, "pr": pr, "rules": rules, "diff": diff},
+        guidance=(
+            f"Review data.diff against data.rules only: the course rules and the rules of {task_id}. "
+            "Anything the rules do not cover is not part of the review. Then post it: "
+            f"e0 review {task_id} --post <<'EOF' ... EOF"
+        ),
+    )
+
+def post_review(root, task, pr):
+    """Post the agent's review on the task's pull request, marked so status can count it."""
+    text, failure = read_body_stdin("review", f"e0 review {task['id']} --post", "the review")
+    if failure:
+        return failure
+    _, error = gh_post(root, REVIEW_MARKER, text, "pr", "review", str(pr["number"]), "--comment")
+    if error:
+        return github_problem(
+            "review", root, f"e0 could not post the review on pull request #{pr['number']}", error
+        )
+    return reply(
+        "review",
+        {"taskId": task["id"], "pr": pr, "posted": True},
+        guidance=(
+            f"The review is on the pull request: {pr['url']}. "
+            "Say the status message for this moment, and fill its {{line}} blank from the review."
+        ),
+    )
+
+def decode_question(question, shuffle=True):
+    """A question the agent can ask and grade: the correct option in `answer`, options
+    shuffled so the position teaches nothing. Open questions carry their outline.
+    The record lists options in course order, so it passes shuffle=False."""
+    decoded = {
+        "id": question.get("id"),
+        "type": question.get("type"),
+        "topic": question.get("topic"),
+        "prompt": question.get("prompt", ""),
+    }
+    if question.get("type") == "mcq":
+        options = list(question.get("options", []))
+        answer = next(
+            (
+                option
+                for option in options
+                if hashlib.sha256(option.encode("utf-8")).hexdigest() == question.get("answerHash")
+            ),
+            None,
+        )
+        if shuffle:
+            random.shuffle(options)
+        decoded.update({"options": options, "answer": answer})
+    else:
+        decoded.update(
+            {
+                "outline": question.get("openAnswerOutline", ""),
+                "mandatory": bool(question.get("mandatory", False)),
+            }
+        )
+    return decoded
+
+def fetch_questions(config, path, shuffle=True):
+    text = fetch_text(raw_content_url(config, path))
+    if text is None:
+        return []
+    try:
+        bank = json.loads(text)
+    except ValueError:
+        return []
+    return [
+        decode_question(q, shuffle=shuffle)
+        for q in bank.get("questions", [])
+        if isinstance(q, dict)
+    ]
+
+def questions_for_task(config, task, shuffle=True):
+    """The task's own bank, then each related topic's bank."""
+    questions = fetch_questions(
+        config, f"tasks/{task['id'].lower()}/questions.json", shuffle=shuffle
+    )
+    for topic in task.get("relatedTopics", []):
+        questions.extend(
+            fetch_questions(config, f"knowledgebase/{topic}/questions.json", shuffle=shuffle)
+        )
+    return questions
+
+def cmd_questions(args):
+    """The comprehension questions of a task: its own bank plus its related topics, with the
+    student's diff to personalize them against."""
+    root, catalog, task, failure = resolve_task("questions", args)
+    if failure:
+        return failure
+
+    config = read_config(root)
+    task_id = task["id"]
+    questions = questions_for_task(config, task)
+
+    # The diff and the record are nice to have: the questions work without GitHub.
+    progress, _ = github_progress(root, catalog)
+    entry = (progress or {}).get(task_id, {})
+    diff, _ = pr_diff(root, entry.get("pr"))
+
+    data = {
+        "taskId": task_id,
+        "questions": questions,
+        "diff": diff,
+        "recorded": bool(entry.get("questionsRecorded")),
+    }
+    if not questions:
+        return reply(
+            "questions",
+            data,
+            f"{task_id} has no questions. There is nothing to ask.",
+        )
+    return reply(
+        "questions",
+        data,
+        guidance=(
+            f"{len(questions)} question(s) in data.questions, the correct option in `answer`. "
+            "Ask them one at a time, in the terms of data.diff, as the learning skill's "
+            "Comprehension questions section says. When the set is done, or they decline, run "
+            f"`e0 record {task_id} <<'EOF'` with the JSON that section describes."
+        ),
+    )
+
+def _alert_lines(kind, lines):
+    """A GitHub alert. GitHub strips style attributes, so TIP (green) and CAUTION (red)
+    are the backgrounds a comment is allowed to have."""
+    quoted = [f"> [!{kind}]"]
+    for line in lines:
+        quoted.append(">" if line == "" else f"> {line}")
+    return quoted
+
+def _checkbox(option, picked):
+    mark = "x" if option == picked else " "
+    return f"- [{mark}] {option}"
+
+def _flatten(text):
+    return " ".join(str(text).split())
+
+def render_mcq(question, result):
+    """One multiple-choice question: every option once, in course order. The pick and the
+    right option sit in a colored alert; the rest stay plain checkboxes."""
+    lines = [f"### {_flatten(question.get('prompt', ''))}", ""]
+    if result.get("skipped") is True:
+        lines.extend(_alert_lines("NOTE", ["Skipped."]))
+        return lines
+    picked = result.get("picked")
+    answer = question.get("answer")
+    plain = []
+
+    def flush():
+        if plain:
+            lines.extend(plain)
+            lines.append("")
+            plain.clear()
+
+    for option in question.get("options", []):
+        box = _checkbox(option, picked)
+        if option == picked and picked == answer:
+            flush()
+            lines.extend(_alert_lines("TIP", ["Correct", "", box]))
+            lines.append("")
+        elif option == picked:
+            flush()
+            lines.extend(_alert_lines("CAUTION", ["Not this one", "", box]))
+            lines.append("")
+        elif option == answer:
+            flush()
+            lines.extend(_alert_lines("TIP", ["The answer", "", box]))
+            lines.append("")
+        else:
+            plain.append(box)
+    flush()
+    return lines
+
+def render_open(question, result):
+    """An open question: the discussion summary, green when the outline was covered."""
+    lines = [f"### {_flatten(question.get('prompt', ''))}", ""]
+    if result.get("skipped") is True:
+        lines.extend(_alert_lines("NOTE", ["Skipped."]))
+        return lines
+    kind = "CAUTION" if result.get("missed") is True else "TIP"
+    summary = str(result.get("summary") or "").strip()
+    lines.extend(_alert_lines(kind, summary.splitlines() or [""]))
+    return lines
+
+def _record_problem(summary):
+    return problem(
+        "record",
+        summary,
+        "Pass one JSON object through a quoted heredoc: `e0 record <id> <<'EOF' ... EOF`. "
+        'Either {"skipped": true}, or {"results": [one entry per question]}. '
+        'An mcq entry is {"id", "picked"} with the option text. '
+        'An open entry is {"id", "summary", "missed"} with missed true or false. '
+        'A question they skip is {"id", "skipped": true}.',
+    )
+
+def build_questions_comment(questions, payload, today):
+    """The issue comment for a finished check. Returns (text, None) or (None, problem)."""
+    if not isinstance(payload, dict):
+        return None, _record_problem("e0 record needs one JSON object.")
+    if payload.get("skipped") is True:
+        if "results" in payload:
+            return None, _record_problem(
+                'A declined check is {"skipped": true} on its own, with no results.'
+            )
+        return f"Skipped by the student on {today}.", None
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return None, _record_problem("e0 record needs a results list, or {\"skipped\": true}.")
+    by_id = {}
+    for item in results:
+        if not isinstance(item, dict) or not item.get("id"):
+            return None, _record_problem("Each result needs an id.")
+        if item["id"] in by_id:
+            return None, _record_problem(f"Question {item['id']} is in the results twice.")
+        by_id[item["id"]] = item
+    expected = [question["id"] for question in questions]
+    if set(by_id) != set(expected):
+        missing = [qid for qid in expected if qid not in by_id]
+        extra = [qid for qid in by_id if qid not in set(expected)]
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if extra:
+            detail.append("unknown " + ", ".join(extra))
+        return None, _record_problem(
+            f"The results have to cover every question of this task: {'; '.join(detail)}."
+        )
+    blocks = [f"## Comprehension check ({today})", ""]
+    for question in questions:
+        result = by_id[question["id"]]
+        skipped = result.get("skipped") is True
+        if question.get("type") == "mcq":
+            if not skipped:
+                if not question.get("answer"):
+                    return None, _record_problem(
+                        f"e0 cannot tell which option is right for {question['id']}, so it did not post."
+                    )
+                if result.get("picked") not in question.get("options", []):
+                    return None, _record_problem(
+                        f"The pick for {question['id']} is not one of its options."
+                    )
+            blocks.extend(render_mcq(question, result))
+        else:
+            if not skipped:
+                if not str(result.get("summary") or "").strip():
+                    return None, _record_problem(f"Question {question['id']} needs a summary.")
+                if not isinstance(result.get("missed"), bool):
+                    return None, _record_problem(
+                        f"Question {question['id']} needs missed true or false."
+                    )
+            blocks.extend(render_open(question, result))
+        blocks.append("")
+    return "\n".join(blocks).strip(), None
+
+def cmd_record(args):
+    """Record the comprehension check as a comment on the task's issue. GitHub is the only
+    record: the agent pipes JSON in, and nothing is written in the repo."""
+    root, catalog, task, failure = resolve_task("record", args)
+    if failure:
+        return failure
+    text, failure = read_body_stdin(
+        "record", f"e0 record {task['id']}", "the comprehension results as JSON"
+    )
+    if failure:
+        return failure
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return _record_problem("e0 record could not read the JSON on its input.")
+    progress, failure = require_progress("record", root, catalog)
+    if failure:
+        return failure
+    entry = progress.get(task["id"])
+    if not entry:
+        return problem(
+            "record",
+            f"{task['id']} has no issue, so there is nowhere to record the questions.",
+            "Only a task that was started has an issue.",
+        )
+
+    if not (isinstance(payload, dict) and payload.get("skipped") is True):
+        questions = questions_for_task(read_config(root), task, shuffle=False)
+        if not questions:
+            return _record_problem(f"{task['id']} has no questions to record.")
+    else:
+        questions = []
+    comment, failure = build_questions_comment(
+        questions, payload, datetime.date.today().isoformat()
+    )
+    if failure:
+        return failure
+
+    issue = entry["issue"]
+    out, error = gh_post(root, QUESTIONS_MARKER, comment, "issue", "comment", str(issue["number"]))
+    if error:
+        return github_problem(
+            "record", root, f"e0 could not comment on issue #{issue['number']}", error
+        )
+    return reply(
+        "record",
+        {"taskId": task["id"], "issue": issue, "url": out or issue["url"]},
+        (
+            f"That's {task['id']} done, all the way: issue, branch, tests, pull request, "
+            "review, merge, questions. {line: one line on what they did well} "
+            "{line: the ready tasks, each as id and title, then ask if they want to start one}"
+        ),
+        guidance=(
+            f"Recorded on {out or issue['url']}. The comment lists each question with their "
+            "answer. Fill the two {{line}} blanks. Ready tasks come from `e0 status`, in data.ready."
+        ),
+    )
+
+
+# ---------------------------------------------------------------- dispatch
+
+COMMANDS = {
+    "catalog": cmd_catalog,
+    "check": cmd_check,
+    "dismiss": cmd_dismiss,
+    "help": cmd_help,
+    "init": cmd_init,
+    "profile": cmd_profile,
+    "questions": cmd_questions,
+    "read": cmd_read,
+    "record": cmd_record,
+    "review": cmd_review,
+    "start": cmd_start,
+    "status": cmd_status,
+    "task": cmd_task,
+}
+
+DEFAULT_COMMAND = "status"
+
+_HELP_ALIASES = {"--help", "-h", "-help", "help", "h", "?", "--version", "-v", "version"}
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    raw = argv[0] if argv else DEFAULT_COMMAND
+    command = "help" if raw in _HELP_ALIASES else raw
+    rest = argv[1:]
+
+    try:
+        handler = COMMANDS.get(command)
+        if handler is None:
+            result = problem(
+                command,
+                f"'{command}' is not a command e0 knows.",
+                "Run 'e0 help' to see what commands you can use.",
+            )
+        else:
+            result = handler(rest)
+    except Exception as exc:  # noqa: BLE001 - the never-crash guarantee lives here
+        result = problem(
+            command,
+            f"e0 hit an unexpected error: {exc.__class__.__name__}: {exc}",
+            "This is a bug in e0, not something the student did. "
+            "Show them the message, ask them to report it, and do not keep retrying.",
+            tell=True,
+        )
+
+    attach_upgrade(result)
+    print(json.dumps(result, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
